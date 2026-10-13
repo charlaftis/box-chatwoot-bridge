@@ -10,6 +10,8 @@ const {
   ESCALATION_TEAM_ID,
   PENDING_IDLE_MINUTES = '30',
   NO_USER_MESSAGE_LABEL = 'no-user-message',
+  DIFY_TIMEOUT_MS = '30000',
+  CHATWOOT_TIMEOUT_MS = '10000',
 } = process.env;
 
 const FALLBACK_TEXT = 'Σας συνδέουμε με έναν εκπρόσωπο.';
@@ -111,7 +113,7 @@ async function handleIncomingMessage(payload) {
 
   markUserActivity(account.id, conversation.id);
   await runInConversationQueue(conversation.id, () =>
-    replyFromDify(account.id, conversation.id, content, buildConversationInputs(conversation))
+    replyIfStillPending(account.id, conversation, content)
   );
 }
 
@@ -130,8 +132,18 @@ async function handleButtonClick(payload) {
   markUserActivity(account.id, conversation.id);
   // Dify finds the button from its exact text, with the emoji.
   await runInConversationQueue(conversation.id, () =>
-    replyFromDify(account.id, conversation.id, value, buildConversationInputs(conversation))
+    replyIfStillPending(account.id, conversation, value)
   );
+}
+
+/**
+ * The status in the webhook is the status when the user wrote. An earlier event in the queue
+ * can escalate or resolve the conversation, so the bridge reads the status again before it asks Dify.
+ */
+async function replyIfStillPending(accountId, conversation, query) {
+  const current = await callChatwoot('GET', `/api/v1/accounts/${accountId}/conversations/${conversation.id}`);
+  if (current?.status !== 'pending') return;
+  await replyFromDify(accountId, conversation.id, query, buildConversationInputs(conversation));
 }
 
 /**
@@ -155,15 +167,19 @@ async function handleWidgetOpened(payload) {
   console.log('conversation_started', conversation.id);
 
   const inputs = buildDifyInputs(contactAttributes, contact?.identifier);
-  await runInConversationQueue(conversation.id, () => replyFromDify(account.id, conversation.id, START_QUERY, inputs));
+  // The user did not write yet. If Dify fails, the conversation stays pending: the next user message tries Dify again.
+  await runInConversationQueue(conversation.id, () =>
+    replyFromDify(account.id, conversation.id, START_QUERY, inputs, { escalateOnError: false })
+  );
 }
 
-async function replyFromDify(accountId, conversationId, query, inputs) {
+async function replyFromDify(accountId, conversationId, query, inputs, { escalateOnError = true } = {}) {
   let reply;
   try {
     reply = parseDifyAnswer(await askDify(conversationId, query, inputs));
   } catch (error) {
     console.error('dify_error', conversationId, error.message);
+    if (!escalateOnError) return;
     reply = { text: FALLBACK_TEXT, options: [], escalate: true, escalateReason: DIFY_ERROR_REASON, resolve: false };
   }
   await applyReply(accountId, conversationId, reply);
@@ -310,6 +326,8 @@ async function askDify(conversationId, query, inputs) {
       conversation_id: store.get(difyConversationKey) || '',
       user: `chatwoot_conversation_${conversationId}`,
     }),
+    // A call with no answer must not block the queue of the conversation.
+    signal: AbortSignal.timeout(Number(DIFY_TIMEOUT_MS)),
   });
   if (!response.ok) throw new Error(`Dify ${response.status}: ${await response.text()}`);
   const data = await response.json();
@@ -322,6 +340,7 @@ async function callChatwoot(method, path, body) {
     method,
     headers: { api_access_token: CHATWOOT_BOT_TOKEN, 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(Number(CHATWOOT_TIMEOUT_MS)),
   });
   if (!response.ok) throw new Error(`Chatwoot ${response.status}: ${await response.text()}`);
   const text = await response.text();
